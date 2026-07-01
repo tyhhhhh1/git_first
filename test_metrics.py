@@ -48,6 +48,10 @@ REAL_SERUM_RECIPE_CSV = r'/home/ty/PycharmProjects/结合loss'
 EXPERIMENTAL_PURE_DIR = r'/home/ty/PycharmProjects/数据集双/network_ready'
 
 FINETUNED_SAVE_PATH = r'/home/ty/PycharmProjects/数据集双/checkpoints/best_model_experimental_area_refine.pth'
+BEST_BY_SCORE_PATH = os.path.join(SAVE_PATH, "best_by_score.pth")
+BEST_BY_TABLE_S1_EXTERNAL_RAW_MAPE_PATH = os.path.join(SAVE_PATH, "best_by_table_s1_external_raw_mape.pth")
+BEST_BY_LOW_FALSE_POSITIVE_PATH = os.path.join(SAVE_PATH, "best_by_low_false_positive.pth")
+LATEST_EPOCH_PATH = os.path.join(SAVE_PATH, "latest_epoch.pth")
 
 # Table S1 is used only as a calibration/holdout diagnostic. The main training
 # stream remains random experimental-pure-spectrum superposition.
@@ -58,6 +62,15 @@ TABLE_S1_EVAL_REPEATS = 1
 TABLE_S1_EVAL_AUGMENT = False
 
 SERUM_FOCUS = ['Asparagine', 'Glutamine', 'Glutamate', 'Isoleucine', 'Leucine', 'Proline', 'Valine']
+HARD_FP_WEIGHTS = {
+    'Proline': 3.0,
+    'Glutamate': 1.5,
+    'Glutamine': 1.5,
+    'Asparagine': 1.0,
+    'Isoleucine': 1.0,
+    'Leucine': 1.0,
+    'Valine': 1.0,
+}
 OVERLAP_GROUPS = [
     ('Glutamine', 'Glutamate', 'Asparagine'),
     ('Isoleucine', 'Leucine', 'Valine', 'Proline'),
@@ -179,19 +192,31 @@ def evaluate_classification_metrics(pred_maxes, target_maxes, names, threshold=0
         print(f"   [classification] TP={tp}, TN={tn}, FP={fp}, FN={fn}")
         print(f"   [rates] TPR={tpr * 100:.2f}% | TNR={tnr * 100:.2f}% | FPR={fpr * 100:.2f}% | FNR={fnr * 100:.2f}%")
         print(f"   [F1] {f1 * 100:.2f}%")
-        print("   [per-compound recall]")
+        print("   [per-compound classification]")
+    per_compound_stats = {}
     for idx, name in enumerate(names):
         if name not in SERUM_FOCUS:
             continue
         positives = target_binary[:, idx].sum()
-        if positives == 0:
-            continue
         hit = ((pred_binary[:, idx] == 1) & (target_binary[:, idx] == 1)).sum()
         false_negative = ((pred_binary[:, idx] == 0) & (target_binary[:, idx] == 1)).sum()
         false_positive = ((pred_binary[:, idx] == 1) & (target_binary[:, idx] == 0)).sum()
         recall = hit / (positives + 1e-8)
+        compound_precision = hit / (hit + false_positive + 1e-8)
+        per_compound_stats[name] = {
+            'tp': int(hit),
+            'fp': int(false_positive),
+            'fn': int(false_negative),
+            'positives': int(positives),
+            'recall': float(recall),
+            'precision': float(compound_precision),
+        }
         if verbose:
-            print(f"      {name:12s} recall={recall * 100:6.2f}% | TP={hit:4d} FN={false_negative:4d} FP={false_positive:4d}")
+            print(
+                f"      {name:12s} recall={recall * 100:6.2f}% | "
+                f"precision={compound_precision * 100:6.2f}% | "
+                f"TP={hit:4d} FN={false_negative:4d} FP={false_positive:4d}"
+            )
 
     # Serum recall is a better best-model signal than global TN-heavy accuracy.
     serum_indices = [i for i, name in enumerate(names) if name in SERUM_FOCUS]
@@ -199,7 +224,14 @@ def evaluate_classification_metrics(pred_maxes, target_maxes, names, threshold=0
     serum_fn = ((pred_binary[:, serum_indices] == 0) & (target_binary[:, serum_indices] == 1)).sum()
     serum_recall = serum_tp / (serum_tp + serum_fn + 1e-8)
     precision = tp / (tp + fp + 1e-8)
-    return f1, serum_recall, fpr, precision
+    return f1, serum_recall, fpr, precision, per_compound_stats
+
+
+def calculate_hard_fp_score(per_compound_stats):
+    score = 0.0
+    for name, weight in HARD_FP_WEIGHTS.items():
+        score += per_compound_stats.get(name, {}).get('fp', 0) * weight
+    return float(score)
 
 
 def experimental_quantitative_aux_loss(predictions, background, targets, mixture_linear):
@@ -340,6 +372,25 @@ def save_global_calibration_factors(factors, epoch):
     print(f"Saved Table S1 global area factors: {out_path}")
 
 
+def _safe_metric_value(metric_dict, key='mape', default=float('inf')):
+    value = metric_dict.get(key, default) if metric_dict else default
+    return float(value) if np.isfinite(value) else default
+
+
+def _mean_channel_value(names, values_by_channel, counts_by_channel, channel_names):
+    indices = [i for i, name in enumerate(names) if name in channel_names]
+    if not indices:
+        return 0.0
+    total_count = float(np.sum(counts_by_channel[indices]))
+    if total_count <= 0:
+        return 0.0
+    return float(np.sum(values_by_channel[indices]) / total_count)
+
+
+def get_checkpoint_state(model):
+    return model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+
+
 def run_training():
     seed_everything(GLOBAL_SEED)
     validate_training_inputs()
@@ -472,7 +523,9 @@ def run_training():
     ).to(DEVICE)
     scaler = torch.cuda.amp.GradScaler()
     best_score = -float('inf')
-    epochs_without_improvement = 0
+    best_external_raw_mape = float('inf')
+    best_hard_fp_score = float('inf')
+    epochs_without_selection_improvement = 0
     phase1_end = max(1, int(EPOCHS * PHASE1_END_RATIO))
     phase2_end = max(phase1_end + 1, int(EPOCHS * PHASE2_END_RATIO))
 
@@ -542,6 +595,9 @@ def run_training():
         total_val_false_peak = 0.0
         total_val_excess = 0.0
         total_val_inactive_area = 0.0
+        inactive_peak_values = []
+        inactive_area_sums_by_channel = torch.zeros(train_dataset.num_classes, device=DEVICE)
+        inactive_counts_by_channel = torch.zeros(train_dataset.num_classes, device=DEVICE)
         all_pred_maxes, all_target_maxes = [], []
 
         with torch.no_grad():
@@ -571,10 +627,16 @@ def run_training():
                     pred_pos.sum(dim=1, keepdim=True) + F.relu(bg) - torch.clamp(m_linear, min=0.0)
                 ).mean().item()
                 inactive_ch = (t.amax(dim=2) <= TRAIN_ACTIVE_THRESHOLD).float()
+                pred_max_by_channel = pred_pos.amax(dim=2)
                 inactive_area = pred_pos.sum(dim=2) * inactive_ch
                 total_val_inactive_area += (
                     inactive_area.sum() / (inactive_ch.sum() + 1e-8)
                 ).item()
+                inactive_area_sums_by_channel += inactive_area.sum(dim=0)
+                inactive_counts_by_channel += inactive_ch.sum(dim=0)
+                inactive_peak = pred_max_by_channel[inactive_ch.bool()]
+                if inactive_peak.numel() > 0:
+                    inactive_peak_values.append(inactive_peak.detach().float().cpu().numpy())
                 all_pred_maxes.append(p.amax(dim=2).detach().cpu().numpy())
                 all_target_maxes.append(t.amax(dim=2).detach().cpu().numpy())
 
@@ -583,19 +645,51 @@ def run_training():
         avg_val_false_peak = total_val_false_peak / VAL_STEPS
         avg_val_excess = total_val_excess / VAL_STEPS
         avg_val_inactive_area = total_val_inactive_area / VAL_STEPS
+        if inactive_peak_values:
+            inactive_peak_values = np.concatenate(inactive_peak_values, axis=0)
+            inactive_peak_mean = float(np.mean(inactive_peak_values))
+            inactive_peak_p95 = float(np.percentile(inactive_peak_values, 95))
+            inactive_peak_max = float(np.max(inactive_peak_values))
+        else:
+            inactive_peak_mean = 0.0
+            inactive_peak_p95 = 0.0
+            inactive_peak_max = 0.0
+        inactive_area_sums_np = inactive_area_sums_by_channel.detach().cpu().numpy()
+        inactive_counts_np = inactive_counts_by_channel.detach().cpu().numpy()
+        proline_inactive_area = _mean_channel_value(
+            train_dataset.names, inactive_area_sums_np, inactive_counts_np, ['Proline']
+        )
+        gln_glu_pro_inactive_area = _mean_channel_value(
+            train_dataset.names, inactive_area_sums_np, inactive_counts_np,
+            ['Glutamine', 'Glutamate', 'Proline']
+        )
+        ile_leu_val_pro_inactive_area = _mean_channel_value(
+            train_dataset.names, inactive_area_sums_np, inactive_counts_np,
+            ['Isoleucine', 'Leucine', 'Valine', 'Proline']
+        )
         print(
             f"Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | "
             f"Val FalsePeak: {avg_val_false_peak:.6f} | Val Excess: {avg_val_excess:.6f} | "
             f"Val InactiveArea: {avg_val_inactive_area:.6f} | "
+            f"Val InactivePeakMean: {inactive_peak_mean:.6f} | "
+            f"Val InactivePeakP95: {inactive_peak_p95:.6f} | "
+            f"Val InactivePeakMax: {inactive_peak_max:.6f} | "
             f"LR: {scheduler.get_last_lr()[0]:.6e}"
+        )
+        print(
+            "   [hard inactive area] "
+            f"Proline={proline_inactive_area:.6f} | "
+            f"Gln/Glu/Pro={gln_glu_pro_inactive_area:.6f} | "
+            f"Ile/Leu/Val/Pro={ile_leu_val_pro_inactive_area:.6f}"
         )
 
         all_pred_maxes = np.concatenate(all_pred_maxes, axis=0)
         all_target_maxes = np.concatenate(all_target_maxes, axis=0)
-        f1, serum_recall, fpr, precision = evaluate_classification_metrics(
+        f1, serum_recall, fpr, precision, per_compound_stats = evaluate_classification_metrics(
             all_pred_maxes, all_target_maxes, train_dataset.names,
             threshold=EVAL_PRESENCE_THRESHOLD,
         )
+        hard_fp_score = calculate_hard_fp_score(per_compound_stats)
         overlap_terms = []
         for group in OVERLAP_GROUPS:
             idx = [train_dataset.mapping[n] for n in group if n in train_dataset.mapping]
@@ -620,36 +714,93 @@ def run_training():
         )
         if fpr > 0.05:
             score -= 2.0
+        latest_table_s1_factors = {}
+        calib_raw = {'mape': float('inf')}
+        calib_cal = {'mape': float('inf')}
+        external_raw = {'mape': float('inf')}
+        external_cal = {'mape': float('inf')}
+        if (epoch + 1) % TABLE_S1_EVAL_EVERY == 0:
+            latest_table_s1_factors, calib_raw, calib_cal, external_raw, external_cal = (
+                print_table_s1_calibration_report(model, val_dataset)
+            )
+        external_raw_mape = _safe_metric_value(external_raw)
+        external_cal_mape = _safe_metric_value(external_cal)
+
         print(
-            f"   [selection] precision={precision * 100:.2f}% | "
+            "   [selection] "
+            f"precision={precision * 100:.2f}% | "
             f"serum_recall={serum_recall * 100:.2f}% | "
-            f"overlap_focus={overlap_focus:.6f} | score={score:.6f}"
+            f"overlap_focus={overlap_focus:.6f} | "
+            f"score={score:.6f} | "
+            f"external_raw_MAPE={external_raw_mape:.2f}% | "
+            f"external_cal_MAPE={external_cal_mape:.2f}% | "
+            f"hard_fp_score={hard_fp_score:.2f} | "
+            f"inactive_peak_p95={inactive_peak_p95:.6f} | "
+            f"best_score={best_score:.6f} | "
+            f"best_external_raw_MAPE={best_external_raw_mape:.2f}% | "
+            f"best_hard_fp_score={best_hard_fp_score:.2f}"
         )
 
-        latest_table_s1_factors = {}
-        if (epoch + 1) % TABLE_S1_EVAL_EVERY == 0:
-            latest_table_s1_factors, _, _, _, _ = print_table_s1_calibration_report(model, val_dataset)
+        state = get_checkpoint_state(model)
+        torch.save(state, LATEST_EPOCH_PATH)
+        print(f"Latest checkpoint saved: {LATEST_EPOCH_PATH}")
 
-        if score > best_score:
+        if (epoch + 1) % VIS_EVERY == 0 or (epoch + 1) == EPOCHS:
+            epoch_path = os.path.join(SAVE_PATH, f"epoch_{epoch + 1}.pth")
+            torch.save(state, epoch_path)
+            print(f"Epoch checkpoint saved: {epoch_path}")
+
+        score_improved = score > best_score
+        external_improved = external_raw_mape < best_external_raw_mape
+        hard_fp_improved = hard_fp_score < best_hard_fp_score and serum_recall >= 0.95
+
+        if score_improved:
             best_score = score
-            epochs_without_improvement = 0
-            state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+            torch.save(state, BEST_BY_SCORE_PATH)
+            print(f"Best-by-score saved: {BEST_BY_SCORE_PATH} | score={best_score:.6f}")
+
+        if external_improved:
+            best_external_raw_mape = external_raw_mape
+            torch.save(state, BEST_BY_TABLE_S1_EXTERNAL_RAW_MAPE_PATH)
             torch.save(state, FINETUNED_SAVE_PATH)
             save_global_calibration_factors(latest_table_s1_factors, epoch + 1)
-            print(f"Best serum refine saved: {FINETUNED_SAVE_PATH} | score={best_score:.6f}")
-        else:
-            epochs_without_improvement += 1
             print(
-                f"No validation score improvement for {epochs_without_improvement}/"
-                f"{EARLY_STOP_PATIENCE} epochs | best_score={best_score:.6f}"
+                "Best-by-Table-S1-external-raw-MAPE saved: "
+                f"{BEST_BY_TABLE_S1_EXTERNAL_RAW_MAPE_PATH} | "
+                f"external_raw_MAPE={best_external_raw_mape:.2f}%"
+            )
+            print(f"Compatibility checkpoint synced: {FINETUNED_SAVE_PATH}")
+
+        if hard_fp_improved:
+            best_hard_fp_score = hard_fp_score
+            torch.save(state, BEST_BY_LOW_FALSE_POSITIVE_PATH)
+            print(
+                f"Best-by-low-false-positive saved: {BEST_BY_LOW_FALSE_POSITIVE_PATH} | "
+                f"hard_fp_score={best_hard_fp_score:.2f} | serum_recall={serum_recall * 100:.2f}%"
+            )
+
+        if external_improved or hard_fp_improved:
+            epochs_without_selection_improvement = 0
+        else:
+            epochs_without_selection_improvement += 1
+            print(
+                "No external-raw-MAPE or hard-FP improvement for "
+                f"{epochs_without_selection_improvement}/{EARLY_STOP_PATIENCE} epochs | "
+                f"best_external_raw_MAPE={best_external_raw_mape:.2f}% | "
+                f"best_hard_fp_score={best_hard_fp_score:.2f}"
             )
 
         if (epoch + 1) % VIS_EVERY == 0 or (epoch + 1) == EPOCHS:
             save_visualization(model, fixed_val_batches, train_dataset.names, epoch + 1)
             save_false_positive_visualization(model, fixed_val_batches, train_dataset.names, epoch + 1)
 
-        if epochs_without_improvement >= EARLY_STOP_PATIENCE:
-            print(f"Early stopping at epoch {epoch + 1}; best_score={best_score:.6f}")
+        if epochs_without_selection_improvement >= EARLY_STOP_PATIENCE:
+            print(
+                f"Early stopping at epoch {epoch + 1}; "
+                f"best_external_raw_MAPE={best_external_raw_mape:.2f}% | "
+                f"best_hard_fp_score={best_hard_fp_score:.2f} | "
+                f"best_score={best_score:.6f}"
+            )
             break
 
 
