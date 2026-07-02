@@ -17,7 +17,7 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 from dataset import NMRSepDataset
 from model import NMRSepFormer
-from loss import PhysicsInformedLoss
+from loss import AreaDominantQuantitativeLoss
 
 
 PROJECT_DIR = r'/home/ty/PycharmProjects/数据集双'
@@ -51,6 +51,7 @@ FINETUNED_SAVE_PATH = r'/home/ty/PycharmProjects/数据集双/checkpoints/best_m
 BEST_BY_SCORE_PATH = os.path.join(SAVE_PATH, "best_by_score.pth")
 BEST_BY_TABLE_S1_EXTERNAL_RAW_MAPE_PATH = os.path.join(SAVE_PATH, "best_by_table_s1_external_raw_mape.pth")
 BEST_BY_LOW_FALSE_POSITIVE_PATH = os.path.join(SAVE_PATH, "best_by_low_false_positive.pth")
+BEST_BY_OVERLAP_LOW_FP_PATH = os.path.join(SAVE_PATH, "best_by_overlap_low_fp.pth")
 LATEST_EPOCH_PATH = os.path.join(SAVE_PATH, "latest_epoch.pth")
 
 # Table S1 is used only as a calibration/holdout diagnostic. The main training
@@ -64,12 +65,17 @@ TABLE_S1_EVAL_AUGMENT = False
 SERUM_FOCUS = ['Asparagine', 'Glutamine', 'Glutamate', 'Isoleucine', 'Leucine', 'Proline', 'Valine']
 HARD_FP_WEIGHTS = {
     'Proline': 3.0,
+    'Leucine': 2.0,
     'Glutamate': 1.5,
     'Glutamine': 1.5,
     'Asparagine': 1.0,
-    'Isoleucine': 1.0,
-    'Leucine': 1.0,
-    'Valine': 1.0,
+    'Isoleucine': 1.5,
+    'Valine': 1.5,
+}
+BCAA_FP_WEIGHTS = {
+    'Leucine': 2.0,
+    'Isoleucine': 1.5,
+    'Valine': 1.5,
 }
 OVERLAP_GROUPS = [
     ('Glutamine', 'Glutamate', 'Asparagine'),
@@ -192,22 +198,22 @@ def evaluate_classification_metrics(pred_maxes, target_maxes, names, threshold=0
         print(f"   [classification] TP={tp}, TN={tn}, FP={fp}, FN={fn}")
         print(f"   [rates] TPR={tpr * 100:.2f}% | TNR={tnr * 100:.2f}% | FPR={fpr * 100:.2f}% | FNR={fnr * 100:.2f}%")
         print(f"   [F1] {f1 * 100:.2f}%")
-        print("   [per-compound classification]")
-    per_compound_stats = {}
+        print("   [per-compound recall]")
+    per_compound = {}
     for idx, name in enumerate(names):
         if name not in SERUM_FOCUS:
             continue
-        positives = target_binary[:, idx].sum()
         hit = ((pred_binary[:, idx] == 1) & (target_binary[:, idx] == 1)).sum()
         false_negative = ((pred_binary[:, idx] == 0) & (target_binary[:, idx] == 1)).sum()
         false_positive = ((pred_binary[:, idx] == 1) & (target_binary[:, idx] == 0)).sum()
+        positives = hit + false_negative
+        predicted = hit + false_positive
         recall = hit / (positives + 1e-8)
-        compound_precision = hit / (hit + false_positive + 1e-8)
-        per_compound_stats[name] = {
+        compound_precision = hit / (predicted + 1e-8)
+        per_compound[name] = {
             'tp': int(hit),
             'fp': int(false_positive),
             'fn': int(false_negative),
-            'positives': int(positives),
             'recall': float(recall),
             'precision': float(compound_precision),
         }
@@ -224,14 +230,82 @@ def evaluate_classification_metrics(pred_maxes, target_maxes, names, threshold=0
     serum_fn = ((pred_binary[:, serum_indices] == 0) & (target_binary[:, serum_indices] == 1)).sum()
     serum_recall = serum_tp / (serum_tp + serum_fn + 1e-8)
     precision = tp / (tp + fp + 1e-8)
-    return f1, serum_recall, fpr, precision, per_compound_stats
+    return f1, serum_recall, fpr, precision, per_compound
 
 
-def calculate_hard_fp_score(per_compound_stats):
+def calculate_hard_fp_score(per_compound):
     score = 0.0
     for name, weight in HARD_FP_WEIGHTS.items():
-        score += per_compound_stats.get(name, {}).get('fp', 0) * weight
+        score += weight * per_compound.get(name, {}).get('fp', 0)
     return float(score)
+
+
+def calculate_bcaa_fp_score(per_compound):
+    score = 0.0
+    for name, weight in BCAA_FP_WEIGHTS.items():
+        score += weight * per_compound.get(name, {}).get('fp', 0)
+    return float(score)
+
+
+def conditional_bcaa_false_positives(pred_maxes, target_maxes, names, threshold=0.02):
+    name_to_idx = {name: idx for idx, name in enumerate(names)}
+    pred_binary = pred_maxes > threshold
+    target_binary = target_maxes > threshold
+
+    def count_false_positive_when(target_name, trigger_names):
+        if target_name not in name_to_idx:
+            return 0
+        trigger_idx = [name_to_idx[name] for name in trigger_names if name in name_to_idx]
+        if not trigger_idx:
+            return 0
+        target_idx = name_to_idx[target_name]
+        target_absent = ~target_binary[:, target_idx]
+        target_predicted = pred_binary[:, target_idx]
+        trigger_active = target_binary[:, trigger_idx].any(axis=1)
+        return int((target_absent & target_predicted & trigger_active).sum())
+
+    return {
+        'Leucine_FP_when_Ile_or_Val_active': count_false_positive_when(
+            'Leucine', ('Isoleucine', 'Valine')
+        ),
+        'Isoleucine_FP_when_Leu_or_Val_active': count_false_positive_when(
+            'Isoleucine', ('Leucine', 'Valine')
+        ),
+        'Valine_FP_when_Ile_or_Leu_active': count_false_positive_when(
+            'Valine', ('Isoleucine', 'Leucine')
+        ),
+    }
+
+
+def inactive_peak_metrics(pred_maxes, target_maxes):
+    inactive = target_maxes <= TRAIN_ACTIVE_THRESHOLD
+    values = pred_maxes[inactive]
+    if values.size == 0:
+        return 0.0, 0.0, 0.0
+    values = np.maximum(values, 0.0)
+    return float(np.mean(values)), float(np.percentile(values, 95)), float(np.max(values))
+
+
+def inactive_area_for_compounds(pred_areas, target_maxes, names, compounds):
+    indices = [idx for idx, name in enumerate(names) if name in compounds]
+    if not indices:
+        return 0.0
+    inactive = target_maxes[:, indices] <= TRAIN_ACTIVE_THRESHOLD
+    values = np.maximum(pred_areas[:, indices], 0.0)
+    if inactive.sum() <= 0:
+        return 0.0
+    return float(values[inactive].mean())
+
+
+def inactive_peak_p95_for_compounds(pred_maxes, target_maxes, names, compounds):
+    indices = [idx for idx, name in enumerate(names) if name in compounds]
+    if not indices:
+        return 0.0
+    inactive = target_maxes[:, indices] <= TRAIN_ACTIVE_THRESHOLD
+    values = np.maximum(pred_maxes[:, indices], 0.0)
+    if inactive.sum() <= 0:
+        return 0.0
+    return float(np.percentile(values[inactive], 95))
 
 
 def experimental_quantitative_aux_loss(predictions, background, targets, mixture_linear):
@@ -256,6 +330,26 @@ def experimental_quantitative_aux_loss(predictions, background, targets, mixture
         + EXPERIMENTAL_AUX_RECON_WEIGHT * recon_loss
         + EXPERIMENTAL_AUX_SILENCE_WEIGHT * inactive_area_loss
     )
+
+
+def area_validation_metrics(predictions, targets):
+    pred_area = F.relu(predictions).sum(dim=-1)
+    target_area = targets.sum(dim=-1)
+    active = (target_area > TRAIN_ACTIVE_THRESHOLD).float()
+    if active.sum() <= 0:
+        zero = predictions.new_tensor(0.0)
+        return zero, zero
+
+    pred_fraction = pred_area / torch.clamp(pred_area.sum(dim=-1, keepdim=True), min=1e-6)
+    target_fraction = target_area / torch.clamp(target_area.sum(dim=-1, keepdim=True), min=1e-6)
+    fraction_mae = (torch.abs(pred_fraction - target_fraction) * active).sum() / (active.sum() + 1e-8)
+
+    target_total = torch.clamp(target_area.sum(dim=-1, keepdim=True), min=1e-6)
+    rel_denom = torch.clamp(target_area + 0.015 * target_total, min=1e-6)
+    recovery_mape = (
+        torch.abs(pred_area - target_area) / rel_denom * active
+    ).sum() / (active.sum() + 1e-8) * 100.0
+    return fraction_mae, recovery_mape
 
 
 def _area_matrix_from_batches(model, dataset, recipe_indices, repeats=TABLE_S1_EVAL_REPEATS,
@@ -372,25 +466,6 @@ def save_global_calibration_factors(factors, epoch):
     print(f"Saved Table S1 global area factors: {out_path}")
 
 
-def _safe_metric_value(metric_dict, key='mape', default=float('inf')):
-    value = metric_dict.get(key, default) if metric_dict else default
-    return float(value) if np.isfinite(value) else default
-
-
-def _mean_channel_value(names, values_by_channel, counts_by_channel, channel_names):
-    indices = [i for i, name in enumerate(names) if name in channel_names]
-    if not indices:
-        return 0.0
-    total_count = float(np.sum(counts_by_channel[indices]))
-    if total_count <= 0:
-        return 0.0
-    return float(np.sum(values_by_channel[indices]) / total_count)
-
-
-def get_checkpoint_state(model):
-    return model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-
-
 def run_training():
     seed_everything(GLOBAL_SEED)
     validate_training_inputs()
@@ -420,6 +495,8 @@ def run_training():
         experimental_scale_range=(0.1, 1.0),
         experimental_shift_range=(-0.03, 0.03),
         experimental_noise_db_range=(35.0, 50.0),
+        proline_hard_negative_prob=0.20,
+        bcaa_hard_negative_prob=0.25,
     )
     if len(train_dataset.experimental_templates) < 20:
         raise RuntimeError(
@@ -443,6 +520,8 @@ def run_training():
         experimental_scale_range=(0.1, 1.0),
         experimental_shift_range=(-0.03, 0.03),
         experimental_noise_db_range=(35.0, 50.0),
+        proline_hard_negative_prob=0.20,
+        bcaa_hard_negative_prob=0.25,
         conc_range=(1.0, 10.0),
         global_shift_range=(-0.020, 0.020),
         jitter_range=(-0.0010, 0.0010),
@@ -471,6 +550,8 @@ def run_training():
         experimental_scale_range=(0.1, 1.0),
         experimental_shift_range=(-0.03, 0.03),
         experimental_noise_db_range=(35.0, 50.0),
+        proline_hard_negative_prob=0.20,
+        bcaa_hard_negative_prob=0.25,
     )
 
     train_loader = DataLoader(
@@ -507,38 +588,44 @@ def run_training():
     optimizer = optim.AdamW(model.parameters(), lr=5e-6, weight_decay=5e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
-    loss_fn = PhysicsInformedLoss(
-        pure_w=1.0,
-        recon_w=1.0,
-        presence_w=0.5,
-        group_w=1.0,
-        fraction_w=1.5,
-        local_false_w=0.35,
-        excess_w=1.0,
+    loss_fn = AreaDominantQuantitativeLoss(
+        area_fraction_w=7.0,
+        area_recovery_w=3.5,
+        group_fraction_w=2.0,
+        shape_w=0.20,
+        recon_w=0.25,
+        presence_w=0.30,
+        inactive_w=2.0,
+        local_false_w=0.30,
+        excess_w=0.50,
         presence_threshold=EVAL_PRESENCE_THRESHOLD,
         target_presence_threshold=TRAIN_ACTIVE_THRESHOLD,
-        negative_presence_weight=2.5,
-        hard_channel_boost=1.2,
+        negative_presence_weight=2.2,
+        hard_channel_boost=1.35,
+        proline_absent_w=3.0,
+        proline_absent_peak_w=1.5,
+        proline_peak_threshold=0.015,
+        leucine_absent_w=1.5,
+        leucine_absent_peak_w=0.75,
+        leucine_peak_threshold=0.015,
         mapping=train_dataset.mapping,
     ).to(DEVICE)
     scaler = torch.cuda.amp.GradScaler()
     best_score = -float('inf')
     best_external_raw_mape = float('inf')
     best_hard_fp_score = float('inf')
-    epochs_without_selection_improvement = 0
+    best_bcaa_fp_score = float('inf')
+    epochs_without_external_or_hard_improvement = 0
     phase1_end = max(1, int(EPOCHS * PHASE1_END_RATIO))
     phase2_end = max(phase1_end + 1, int(EPOCHS * PHASE2_END_RATIO))
 
     for epoch in range(EPOCHS):
         if epoch < phase1_end:
-            w_shape, w_silence = 1.0, 2.5
-            phase = "Phase 1: experimental area stabilization"
+            phase = "Phase 1: area-ratio stabilization"
         elif epoch < phase2_end:
-            w_shape, w_silence = 1.4, 2.2
-            phase = "Phase 2: experimental overlap disentanglement"
+            phase = "Phase 2: overlap area disentanglement"
         else:
-            w_shape, w_silence = 1.2, 2.0
-            phase = "Phase 3: Table S1 calibration check"
+            phase = "Phase 3: quantitative calibration"
 
         print(f"\n--- Epoch {epoch + 1}/{EPOCHS} | {phase} ---")
         model.train()
@@ -552,18 +639,7 @@ def run_training():
             with torch.cuda.amp.autocast():
                 predictions, background = model(mixture)
                 mixture_linear = mixture[:, 0:1, :]
-                l_physics, loss_dict = loss_fn(predictions, targets, background, mixture_linear)
-
-                active_ch = (targets.amax(dim=2) > TRAIN_ACTIVE_THRESHOLD).float()
-                inactive_ch_expanded = (1.0 - active_ch).unsqueeze(2).expand_as(targets)
-
-                cos = F.cosine_similarity(predictions + 1e-6, targets + 1e-6, dim=-1)
-                l_shape = 1.0 - (cos * active_ch).sum() / (active_ch.sum() + 1e-8)
-                l_silence = torch.sum(torch.relu(predictions) * inactive_ch_expanded) / (
-                    torch.sum(inactive_ch_expanded) + 1e-8
-                )
-
-                loss = l_physics + (l_shape * w_shape) + (l_silence * w_silence)
+                loss, loss_dict = loss_fn(predictions, targets, background, mixture_linear)
 
                 if EXPERIMENTAL_AUX_WEIGHT > 0:
                     try:
@@ -595,10 +671,10 @@ def run_training():
         total_val_false_peak = 0.0
         total_val_excess = 0.0
         total_val_inactive_area = 0.0
-        inactive_peak_values = []
-        inactive_area_sums_by_channel = torch.zeros(train_dataset.num_classes, device=DEVICE)
-        inactive_counts_by_channel = torch.zeros(train_dataset.num_classes, device=DEVICE)
+        total_val_area_fraction = 0.0
+        total_val_area_recovery = 0.0
         all_pred_maxes, all_target_maxes = [], []
+        all_pred_areas, all_target_areas = [], []
 
         with torch.no_grad():
             for m, t in fixed_val_batches:
@@ -610,6 +686,9 @@ def run_training():
                     val_loss, _ = loss_fn(p, t, bg, m_linear)
 
                 total_val_loss += val_loss.item()
+                area_fraction, area_recovery = area_validation_metrics(p, t)
+                total_val_area_fraction += area_fraction.item()
+                total_val_area_recovery += area_recovery.item()
                 pred_pos = F.relu(p)
                 target_support = (t > TRAIN_ACTIVE_THRESHOLD).float()
                 target_support = F.max_pool1d(
@@ -627,87 +706,120 @@ def run_training():
                     pred_pos.sum(dim=1, keepdim=True) + F.relu(bg) - torch.clamp(m_linear, min=0.0)
                 ).mean().item()
                 inactive_ch = (t.amax(dim=2) <= TRAIN_ACTIVE_THRESHOLD).float()
-                pred_max_by_channel = pred_pos.amax(dim=2)
                 inactive_area = pred_pos.sum(dim=2) * inactive_ch
                 total_val_inactive_area += (
                     inactive_area.sum() / (inactive_ch.sum() + 1e-8)
                 ).item()
-                inactive_area_sums_by_channel += inactive_area.sum(dim=0)
-                inactive_counts_by_channel += inactive_ch.sum(dim=0)
-                inactive_peak = pred_max_by_channel[inactive_ch.bool()]
-                if inactive_peak.numel() > 0:
-                    inactive_peak_values.append(inactive_peak.detach().float().cpu().numpy())
-                all_pred_maxes.append(p.amax(dim=2).detach().cpu().numpy())
+                all_pred_maxes.append(pred_pos.amax(dim=2).detach().cpu().numpy())
                 all_target_maxes.append(t.amax(dim=2).detach().cpu().numpy())
+                all_pred_areas.append(pred_pos.sum(dim=2).detach().cpu().numpy())
+                all_target_areas.append(t.sum(dim=2).detach().cpu().numpy())
 
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / VAL_STEPS
         avg_val_false_peak = total_val_false_peak / VAL_STEPS
         avg_val_excess = total_val_excess / VAL_STEPS
         avg_val_inactive_area = total_val_inactive_area / VAL_STEPS
-        if inactive_peak_values:
-            inactive_peak_values = np.concatenate(inactive_peak_values, axis=0)
-            inactive_peak_mean = float(np.mean(inactive_peak_values))
-            inactive_peak_p95 = float(np.percentile(inactive_peak_values, 95))
-            inactive_peak_max = float(np.max(inactive_peak_values))
-        else:
-            inactive_peak_mean = 0.0
-            inactive_peak_p95 = 0.0
-            inactive_peak_max = 0.0
-        inactive_area_sums_np = inactive_area_sums_by_channel.detach().cpu().numpy()
-        inactive_counts_np = inactive_counts_by_channel.detach().cpu().numpy()
-        proline_inactive_area = _mean_channel_value(
-            train_dataset.names, inactive_area_sums_np, inactive_counts_np, ['Proline']
-        )
-        gln_glu_pro_inactive_area = _mean_channel_value(
-            train_dataset.names, inactive_area_sums_np, inactive_counts_np,
-            ['Glutamine', 'Glutamate', 'Proline']
-        )
-        ile_leu_val_pro_inactive_area = _mean_channel_value(
-            train_dataset.names, inactive_area_sums_np, inactive_counts_np,
-            ['Isoleucine', 'Leucine', 'Valine', 'Proline']
-        )
+        avg_val_area_fraction = total_val_area_fraction / VAL_STEPS
+        avg_val_area_recovery = total_val_area_recovery / VAL_STEPS
         print(
             f"Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | "
+            f"Val AreaFracMAE: {avg_val_area_fraction:.6f} | "
+            f"Val AreaRecoveryMAPE: {avg_val_area_recovery:.2f}% | "
             f"Val FalsePeak: {avg_val_false_peak:.6f} | Val Excess: {avg_val_excess:.6f} | "
             f"Val InactiveArea: {avg_val_inactive_area:.6f} | "
-            f"Val InactivePeakMean: {inactive_peak_mean:.6f} | "
-            f"Val InactivePeakP95: {inactive_peak_p95:.6f} | "
-            f"Val InactivePeakMax: {inactive_peak_max:.6f} | "
             f"LR: {scheduler.get_last_lr()[0]:.6e}"
-        )
-        print(
-            "   [hard inactive area] "
-            f"Proline={proline_inactive_area:.6f} | "
-            f"Gln/Glu/Pro={gln_glu_pro_inactive_area:.6f} | "
-            f"Ile/Leu/Val/Pro={ile_leu_val_pro_inactive_area:.6f}"
         )
 
         all_pred_maxes = np.concatenate(all_pred_maxes, axis=0)
         all_target_maxes = np.concatenate(all_target_maxes, axis=0)
-        f1, serum_recall, fpr, precision, per_compound_stats = evaluate_classification_metrics(
+        all_pred_areas = np.concatenate(all_pred_areas, axis=0)
+        all_target_areas = np.concatenate(all_target_areas, axis=0)
+        f1, serum_recall, fpr, precision, per_compound = evaluate_classification_metrics(
             all_pred_maxes, all_target_maxes, train_dataset.names,
             threshold=EVAL_PRESENCE_THRESHOLD,
         )
-        hard_fp_score = calculate_hard_fp_score(per_compound_stats)
+        hard_fp_score = calculate_hard_fp_score(per_compound)
+        bcaa_fp_score = calculate_bcaa_fp_score(per_compound)
+        conditional_bcaa_fp = conditional_bcaa_false_positives(
+            all_pred_maxes, all_target_maxes, train_dataset.names,
+            threshold=EVAL_PRESENCE_THRESHOLD,
+        )
+        inactive_peak_mean, inactive_peak_p95, inactive_peak_max = inactive_peak_metrics(
+            all_pred_maxes, all_target_maxes
+        )
+        proline_inactive_area = inactive_area_for_compounds(
+            all_pred_areas, all_target_maxes, train_dataset.names, ('Proline',)
+        )
+        leucine_inactive_area = inactive_area_for_compounds(
+            all_pred_areas, all_target_maxes, train_dataset.names, ('Leucine',)
+        )
+        gln_glu_pro_inactive_area = inactive_area_for_compounds(
+            all_pred_areas, all_target_maxes, train_dataset.names,
+            ('Glutamine', 'Glutamate', 'Proline')
+        )
+        ile_leu_val_pro_inactive_area = inactive_area_for_compounds(
+            all_pred_areas, all_target_maxes, train_dataset.names,
+            ('Isoleucine', 'Leucine', 'Valine', 'Proline')
+        )
+        bcaa_inactive_area = inactive_area_for_compounds(
+            all_pred_areas, all_target_maxes, train_dataset.names,
+            ('Isoleucine', 'Leucine', 'Valine')
+        )
+        leucine_inactive_peak_p95 = inactive_peak_p95_for_compounds(
+            all_pred_maxes, all_target_maxes, train_dataset.names, ('Leucine',)
+        )
+        print(
+            f"   [inactive peaks] Val InactivePeakMean={inactive_peak_mean:.6f} | "
+            f"Val InactivePeakP95={inactive_peak_p95:.6f} | "
+            f"Val InactivePeakMax={inactive_peak_max:.6f}"
+        )
+        print(
+            f"   [overlap-fp] "
+            f"Proline_FP={per_compound.get('Proline', {}).get('fp', 0)} | "
+            f"Leucine_FP={per_compound.get('Leucine', {}).get('fp', 0)} | "
+            f"Isoleucine_FP={per_compound.get('Isoleucine', {}).get('fp', 0)} | "
+            f"Valine_FP={per_compound.get('Valine', {}).get('fp', 0)} | "
+            f"hard_fp_score={hard_fp_score:.2f} | "
+            f"bcaa_fp_score={bcaa_fp_score:.2f}"
+        )
+        print(
+            f"   [conditional BCAA FP] "
+            f"Leu_when_Ile_or_Val={conditional_bcaa_fp['Leucine_FP_when_Ile_or_Val_active']} | "
+            f"Ile_when_Leu_or_Val={conditional_bcaa_fp['Isoleucine_FP_when_Leu_or_Val_active']} | "
+            f"Val_when_Ile_or_Leu={conditional_bcaa_fp['Valine_FP_when_Ile_or_Leu_active']}"
+        )
+        print(
+            f"   [hard inactive area] Proline={proline_inactive_area:.6f} | "
+            f"Leucine={leucine_inactive_area:.6f} | "
+            f"Gln/Glu/Pro={gln_glu_pro_inactive_area:.6f} | "
+            f"Ile/Leu/Val/Pro={ile_leu_val_pro_inactive_area:.6f} | "
+            f"BCAA={bcaa_inactive_area:.6f} | "
+            f"LeucinePeakP95={leucine_inactive_peak_p95:.6f}"
+        )
         overlap_terms = []
         for group in OVERLAP_GROUPS:
             idx = [train_dataset.mapping[n] for n in group if n in train_dataset.mapping]
             if len(idx) < 2:
                 continue
-            p_area = np.maximum(all_pred_maxes[:, idx], 0.0).sum(axis=1)
-            t_area = np.maximum(all_target_maxes[:, idx], 0.0).sum(axis=1)
-            active = t_area > 0.02
+            p_area = np.maximum(all_pred_areas[:, idx], 0.0)
+            t_area = np.maximum(all_target_areas[:, idx], 0.0)
+            group_target_total = t_area.sum(axis=1, keepdims=True)
+            active = group_target_total.squeeze(1) > TRAIN_ACTIVE_THRESHOLD
             if not np.any(active):
                 continue
-            overlap_terms.append(float(np.mean(np.abs(p_area[active] - t_area[active]) / (t_area[active] + 1e-6))))
+            p_fraction = p_area / np.maximum(p_area.sum(axis=1, keepdims=True), 1e-6)
+            t_fraction = t_area / np.maximum(group_target_total, 1e-6)
+            overlap_terms.append(float(np.mean(np.abs(p_fraction[active] - t_fraction[active]).sum(axis=1))))
         overlap_focus = float(np.mean(overlap_terms)) if overlap_terms else 0.0
         score = (
-            serum_recall * 1.2
-            + f1 * 1.5
-            - fpr * 3.0
-            - avg_val_loss * 0.08
-            - overlap_focus * 0.25
+            serum_recall * 0.8
+            + precision * 0.8
+            + f1 * 0.7
+            - fpr * 2.5
+            - avg_val_area_fraction * 4.0
+            - (avg_val_area_recovery / 100.0) * 1.8
+            - overlap_focus * 0.8
             - avg_val_false_peak * 0.8
             - avg_val_excess * 1.2
             - avg_val_inactive_area * 0.5
@@ -715,92 +827,105 @@ def run_training():
         if fpr > 0.05:
             score -= 2.0
         latest_table_s1_factors = {}
-        calib_raw = {'mape': float('inf')}
-        calib_cal = {'mape': float('inf')}
-        external_raw = {'mape': float('inf')}
-        external_cal = {'mape': float('inf')}
+        latest_external_raw_mape = float('nan')
+        latest_external_cal_mape = float('nan')
         if (epoch + 1) % TABLE_S1_EVAL_EVERY == 0:
-            latest_table_s1_factors, calib_raw, calib_cal, external_raw, external_cal = (
-                print_table_s1_calibration_report(model, val_dataset)
+            latest_table_s1_factors, _, _, external_raw, external_cal = print_table_s1_calibration_report(
+                model, val_dataset
             )
-        external_raw_mape = _safe_metric_value(external_raw)
-        external_cal_mape = _safe_metric_value(external_cal)
+            latest_external_raw_mape = external_raw['mape']
+            latest_external_cal_mape = external_cal['mape']
 
         print(
-            "   [selection] "
-            f"precision={precision * 100:.2f}% | "
+            f"   [selection] precision={precision * 100:.2f}% | "
             f"serum_recall={serum_recall * 100:.2f}% | "
-            f"overlap_focus={overlap_focus:.6f} | "
             f"score={score:.6f} | "
-            f"external_raw_MAPE={external_raw_mape:.2f}% | "
-            f"external_cal_MAPE={external_cal_mape:.2f}% | "
+            f"external_raw_MAPE={latest_external_raw_mape:.2f}% | "
+            f"external_cal_MAPE={latest_external_cal_mape:.2f}% | "
             f"hard_fp_score={hard_fp_score:.2f} | "
+            f"bcaa_fp_score={bcaa_fp_score:.2f} | "
             f"inactive_peak_p95={inactive_peak_p95:.6f} | "
             f"best_score={best_score:.6f} | "
             f"best_external_raw_MAPE={best_external_raw_mape:.2f}% | "
-            f"best_hard_fp_score={best_hard_fp_score:.2f}"
+            f"best_hard_fp_score={best_hard_fp_score:.2f} | "
+            f"best_bcaa_fp_score={best_bcaa_fp_score:.2f}"
         )
 
-        state = get_checkpoint_state(model)
+        state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
         torch.save(state, LATEST_EPOCH_PATH)
-        print(f"Latest checkpoint saved: {LATEST_EPOCH_PATH}")
-
+        print(f"Latest epoch saved: {LATEST_EPOCH_PATH}")
         if (epoch + 1) % VIS_EVERY == 0 or (epoch + 1) == EPOCHS:
             epoch_path = os.path.join(SAVE_PATH, f"epoch_{epoch + 1}.pth")
             torch.save(state, epoch_path)
-            print(f"Epoch checkpoint saved: {epoch_path}")
+            print(f"Periodic checkpoint saved: {epoch_path}")
 
-        score_improved = score > best_score
-        external_improved = external_raw_mape < best_external_raw_mape
-        hard_fp_improved = hard_fp_score < best_hard_fp_score and serum_recall >= 0.95
+        improved_external = False
+        improved_hard_fp = False
+        improved_bcaa_fp = False
 
-        if score_improved:
+        if score > best_score:
             best_score = score
             torch.save(state, BEST_BY_SCORE_PATH)
             print(f"Best-by-score saved: {BEST_BY_SCORE_PATH} | score={best_score:.6f}")
 
-        if external_improved:
-            best_external_raw_mape = external_raw_mape
+        if np.isfinite(latest_external_raw_mape) and latest_external_raw_mape < best_external_raw_mape:
+            best_external_raw_mape = latest_external_raw_mape
+            improved_external = True
             torch.save(state, BEST_BY_TABLE_S1_EXTERNAL_RAW_MAPE_PATH)
             torch.save(state, FINETUNED_SAVE_PATH)
             save_global_calibration_factors(latest_table_s1_factors, epoch + 1)
             print(
-                "Best-by-Table-S1-external-raw-MAPE saved: "
+                f"Best-by-Table-S1-external-raw-MAPE saved: "
                 f"{BEST_BY_TABLE_S1_EXTERNAL_RAW_MAPE_PATH} | "
                 f"external_raw_MAPE={best_external_raw_mape:.2f}%"
             )
-            print(f"Compatibility checkpoint synced: {FINETUNED_SAVE_PATH}")
+            print(f"Synced predict-compatible best model: {FINETUNED_SAVE_PATH}")
 
-        if hard_fp_improved:
+        if hard_fp_score < best_hard_fp_score and serum_recall >= 0.95:
             best_hard_fp_score = hard_fp_score
+            improved_hard_fp = True
             torch.save(state, BEST_BY_LOW_FALSE_POSITIVE_PATH)
             print(
                 f"Best-by-low-false-positive saved: {BEST_BY_LOW_FALSE_POSITIVE_PATH} | "
                 f"hard_fp_score={best_hard_fp_score:.2f} | serum_recall={serum_recall * 100:.2f}%"
             )
 
-        if external_improved or hard_fp_improved:
-            epochs_without_selection_improvement = 0
-        else:
-            epochs_without_selection_improvement += 1
+        external_guard_ok = (
+            np.isfinite(latest_external_raw_mape)
+            and (
+                not np.isfinite(best_external_raw_mape)
+                or latest_external_raw_mape <= best_external_raw_mape * 1.5
+            )
+        )
+        if bcaa_fp_score < best_bcaa_fp_score and serum_recall >= 0.95 and external_guard_ok:
+            best_bcaa_fp_score = bcaa_fp_score
+            improved_bcaa_fp = True
+            torch.save(state, BEST_BY_OVERLAP_LOW_FP_PATH)
             print(
-                "No external-raw-MAPE or hard-FP improvement for "
-                f"{epochs_without_selection_improvement}/{EARLY_STOP_PATIENCE} epochs | "
+                f"Best-by-overlap-low-FP saved: {BEST_BY_OVERLAP_LOW_FP_PATH} | "
+                f"bcaa_fp_score={best_bcaa_fp_score:.2f} | "
+                f"external_raw_MAPE={latest_external_raw_mape:.2f}% | "
+                f"serum_recall={serum_recall * 100:.2f}%"
+            )
+
+        if improved_external or improved_hard_fp or improved_bcaa_fp:
+            epochs_without_external_or_hard_improvement = 0
+        else:
+            epochs_without_external_or_hard_improvement += 1
+            print(
+                f"No external_raw_MAPE or hard-FP improvement for "
+                f"{epochs_without_external_or_hard_improvement}/{EARLY_STOP_PATIENCE} epochs | "
                 f"best_external_raw_MAPE={best_external_raw_mape:.2f}% | "
-                f"best_hard_fp_score={best_hard_fp_score:.2f}"
+                f"best_hard_fp_score={best_hard_fp_score:.2f} | "
+                f"best_bcaa_fp_score={best_bcaa_fp_score:.2f}"
             )
 
         if (epoch + 1) % VIS_EVERY == 0 or (epoch + 1) == EPOCHS:
             save_visualization(model, fixed_val_batches, train_dataset.names, epoch + 1)
             save_false_positive_visualization(model, fixed_val_batches, train_dataset.names, epoch + 1)
 
-        if epochs_without_selection_improvement >= EARLY_STOP_PATIENCE:
-            print(
-                f"Early stopping at epoch {epoch + 1}; "
-                f"best_external_raw_MAPE={best_external_raw_mape:.2f}% | "
-                f"best_hard_fp_score={best_hard_fp_score:.2f} | "
-                f"best_score={best_score:.6f}"
-            )
+        if epochs_without_external_or_hard_improvement >= EARLY_STOP_PATIENCE:
+            print(f"Early stopping at epoch {epoch + 1}; best_score={best_score:.6f}")
             break
 
 

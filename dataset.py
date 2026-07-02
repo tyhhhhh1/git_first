@@ -66,6 +66,7 @@ class NMRSepDataset(Dataset):
                  experimental_min_components=2, experimental_max_components=12,
                  experimental_scale_range=(0.1, 1.0), experimental_shift_range=(-0.03, 0.03),
                  experimental_noise_db_range=(35.0, 50.0),
+                 proline_hard_negative_prob=0.20, bcaa_hard_negative_prob=0.25,
                  pdf_method_mix=False, pdf_method1_prob=0.5, pdf_balanced_sampling=True,
                  dataset_length=20000, deterministic_seed=None):
         """
@@ -100,6 +101,8 @@ class NMRSepDataset(Dataset):
         self.experimental_scale_range = experimental_scale_range
         self.experimental_shift_range = experimental_shift_range
         self.experimental_noise_db_range = experimental_noise_db_range
+        self.proline_hard_negative_prob = float(proline_hard_negative_prob)
+        self.bcaa_hard_negative_prob = float(bcaa_hard_negative_prob)
         self.pdf_method_mix = pdf_method_mix
         self.pdf_method1_prob = pdf_method1_prob
         self.pdf_balanced_sampling = pdf_balanced_sampling
@@ -127,6 +130,22 @@ class NMRSepDataset(Dataset):
             self.templates[name] = self._generate_template(name)
         self.experimental_templates = self._load_experimental_templates(experimental_pure_dir)
         self.experimental_names = sorted(self.experimental_templates.keys())
+        self.proline_hard_negative_groups = [
+            ['Glutamine', 'Glutamate'],
+            ['Asparagine', 'Glutamine', 'Glutamate'],
+            ['Glutamine', 'Glutamate', 'Isoleucine'],
+            ['Glutamine', 'Glutamate', 'Valine'],
+            ['Glutamine', 'Glutamate', 'Isoleucine', 'Leucine', 'Valine'],
+        ]
+        self.bcaa_hard_negative_groups = [
+            {'present': ['Isoleucine', 'Valine'], 'absent': ['Leucine']},
+            {'present': ['Isoleucine'], 'absent': ['Leucine', 'Valine']},
+            {'present': ['Valine'], 'absent': ['Leucine', 'Isoleucine']},
+            {'present': ['Leucine', 'Valine'], 'absent': ['Isoleucine']},
+            {'present': ['Isoleucine', 'Leucine'], 'absent': ['Valine']},
+            {'present': ['Isoleucine', 'Valine', 'Glutamine'], 'absent': ['Leucine']},
+            {'present': ['Isoleucine', 'Valine', 'Asparagine'], 'absent': ['Leucine']},
+        ]
 
         self.serum_panel = [
             'Asparagine', 'Glutamine', 'Glutamate',
@@ -377,15 +396,15 @@ class NMRSepDataset(Dataset):
         noise_std = rms / (10.0 ** (snr_db / 20.0))
         return (mixture + np.random.normal(0.0, noise_std, mixture.shape)).astype(np.float32)
 
-    def _generate_experimental_superposition(self):
+    def _build_experimental_superposition_from_names(self, selected):
         NUM_CHANNELS = 20
-        max_n = min(max(1, self.experimental_max_components), len(self.experimental_names))
-        min_n = min(max(1, self.experimental_min_components), max_n)
-        if max_n < 1:
+        selected = [
+            name for name in selected
+            if name in self.mapping and name in self.experimental_templates
+        ]
+        selected = list(dict.fromkeys(selected))
+        if not selected:
             return None
-
-        n = np.random.randint(min_n, max_n + 1)
-        selected = list(np.random.choice(self.experimental_names, n, replace=False))
 
         final_targets = torch.zeros(NUM_CHANNELS, self.signal_len)
         mixture = np.zeros(self.signal_len, dtype=np.float32)
@@ -410,6 +429,71 @@ class NMRSepDataset(Dataset):
         mixture_log = np.log10(mixture + 1e-6)
         dual_mixture = np.stack([mixture, mixture_log], axis=0).astype(np.float32)
         return torch.FloatTensor(dual_mixture), final_targets, actual_names
+
+    def _generate_experimental_superposition(self):
+        max_n = min(max(1, self.experimental_max_components), len(self.experimental_names))
+        min_n = min(max(1, self.experimental_min_components), max_n)
+        if max_n < 1:
+            return None
+
+        n = np.random.randint(min_n, max_n + 1)
+        selected = list(np.random.choice(self.experimental_names, n, replace=False))
+        return self._build_experimental_superposition_from_names(selected)
+
+    def _generate_proline_hard_negative_superposition(self):
+        if (
+            self.proline_hard_negative_prob <= 0.0
+            or not self.experimental_templates
+            or 'Proline' not in self.mapping
+        ):
+            return None
+
+        valid_groups = []
+        for group in self.proline_hard_negative_groups:
+            if 'Proline' in group:
+                continue
+            if all(name in self.mapping and name in self.experimental_templates for name in group):
+                valid_groups.append(group)
+        if not valid_groups:
+            return None
+
+        selected = list(valid_groups[np.random.randint(0, len(valid_groups))])
+        sample = self._build_experimental_superposition_from_names(selected)
+        if sample is None:
+            return None
+
+        mixture, final_targets, actual_names = sample
+        proline_idx = self.mapping['Proline']
+        final_targets[proline_idx].zero_()
+        actual_names[proline_idx] = "None"
+        return mixture, final_targets, actual_names
+
+    def _generate_bcaa_hard_negative_superposition(self):
+        if self.bcaa_hard_negative_prob <= 0.0 or not self.experimental_templates:
+            return None
+
+        valid_groups = []
+        for group in self.bcaa_hard_negative_groups:
+            present = group['present']
+            absent = group['absent']
+            if all(name in self.mapping and name in self.experimental_templates for name in present):
+                valid_absent = [name for name in absent if name in self.mapping]
+                if valid_absent:
+                    valid_groups.append({'present': present, 'absent': valid_absent})
+        if not valid_groups:
+            return None
+
+        group = valid_groups[np.random.randint(0, len(valid_groups))]
+        sample = self._build_experimental_superposition_from_names(group['present'])
+        if sample is None:
+            return None
+
+        mixture, final_targets, actual_names = sample
+        for name in group['absent']:
+            compound_id = self.mapping[name]
+            final_targets[compound_id].zero_()
+            actual_names[compound_id] = "None"
+        return mixture, final_targets, actual_names
 
     def generate_experimental_recipe_sample(self, recipe, augment=True):
         """Build one sample from experimental pure spectra and an explicit recipe.
@@ -635,6 +719,14 @@ class NMRSepDataset(Dataset):
 
         if self.pdf_method_mix:
             if self.experimental_templates and self._pdf_use_method1(idx):
+                if np.random.rand() < self.proline_hard_negative_prob:
+                    hard_negative = self._generate_proline_hard_negative_superposition()
+                    if hard_negative is not None:
+                        return hard_negative
+                if np.random.rand() < self.bcaa_hard_negative_prob:
+                    hard_negative = self._generate_bcaa_hard_negative_superposition()
+                    if hard_negative is not None:
+                        return hard_negative
                 experimental_sample = self._generate_experimental_superposition()
                 if experimental_sample is not None:
                     return experimental_sample
@@ -643,6 +735,14 @@ class NMRSepDataset(Dataset):
         recipe = self._random_serum_recipe() if self.serum_finetune else None
 
         if self.experimental_templates and np.random.rand() < self.experimental_mix_prob:
+            if np.random.rand() < self.proline_hard_negative_prob:
+                hard_negative = self._generate_proline_hard_negative_superposition()
+                if hard_negative is not None:
+                    return hard_negative
+            if np.random.rand() < self.bcaa_hard_negative_prob:
+                hard_negative = self._generate_bcaa_hard_negative_superposition()
+                if hard_negative is not None:
+                    return hard_negative
             experimental_sample = self._generate_experimental_superposition()
             if experimental_sample is not None:
                 return experimental_sample
